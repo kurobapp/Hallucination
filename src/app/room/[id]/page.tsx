@@ -1,14 +1,9 @@
-// 題目: メインゲームUI（ロジック分離版）
+// 題目: メインゲームUI（フロントエンド完結版）
 "use client";
 
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
 import { supabase } from "@/lib/supabase";
-import {
-  startGameAPI,
-  submitNightActionAPI,
-  calculateResultAPI,
-} from "@/app/actions";
 
 // 題目: 型定義
 type Role =
@@ -32,7 +27,6 @@ type Player = {
   vote_target?: string;
   skip_vote?: boolean;
   extend_vote?: boolean;
-  action_result?: string;
 };
 
 type RoomStatus = "waiting" | "night" | "day" | "vote" | "end";
@@ -46,13 +40,14 @@ export default function RoomPage() {
   const [hasJoined, setHasJoined] = useState(false);
   const [roomStatus, setRoomStatus] = useState<RoomStatus>("waiting");
   const [dayEndsAt, setDayEndsAt] = useState<string | null>(null);
-  const [resultData, setResultData] = useState<any>(null);
+  const [centerCards, setCenterCards] = useState<Role[]>([]);
 
   const [myRole, setMyRole] = useState<Role | null>(null);
   const [myPerceivedRole, setMyPerceivedRole] = useState<Role | null>(null);
   const [isHallucinating, setIsHallucinating] = useState(false);
 
   const [targetId, setTargetId] = useState<string>("");
+  const [actionResult, setActionResult] = useState<string | null>(null);
   const [voteTargetId, setVoteTargetId] = useState<string>("");
   const [isMyActionDone, setIsMyActionDone] = useState(false);
   const [timeLeft, setTimeLeft] = useState<number>(0);
@@ -81,7 +76,7 @@ export default function RoomPage() {
       if (roomData) {
         setRoomStatus(roomData.status);
         setDayEndsAt(roomData.day_ends_at);
-        if (roomData.result_data) setResultData(roomData.result_data);
+        if (roomData.center_cards) setCenterCards(roomData.center_cards);
       }
 
       const { data: playersData } = await supabase
@@ -99,13 +94,26 @@ export default function RoomPage() {
           if (roomData?.status === "vote") setIsMyActionDone(!!me.vote_target);
         }
 
-        if (
-          roomData?.status === "vote" &&
-          playersData.length > 0 &&
-          me?.is_host
-        ) {
+        if (roomData?.status === "night" && playersData.length > 0) {
+          const allReady = playersData.every((p: Player) => p.is_ready);
+          if (allReady && me?.is_host) {
+            const endTime = new Date();
+            endTime.setMinutes(endTime.getMinutes() + 3);
+            await supabase
+              .from("rooms")
+              .update({ status: "day", day_ends_at: endTime.toISOString() })
+              .eq("id", roomId);
+          }
+        }
+
+        if (roomData?.status === "vote" && playersData.length > 0) {
           const allVoted = playersData.every((p: Player) => p.vote_target);
-          if (allVoted) await calculateResultAPI(roomId);
+          if (allVoted && me?.is_host) {
+            await supabase
+              .from("rooms")
+              .update({ status: "end" })
+              .eq("id", roomId);
+          }
         }
 
         if (
@@ -174,10 +182,12 @@ export default function RoomPage() {
         (payload) => {
           setRoomStatus(payload.new.status);
           setDayEndsAt(payload.new.day_ends_at);
-          if (payload.new.result_data) setResultData(payload.new.result_data);
+          if (payload.new.center_cards)
+            setCenterCards(payload.new.center_cards);
 
           if (payload.new.status === "day" || payload.new.status === "vote") {
             setIsMyActionDone(false);
+            setActionResult(null);
             setTargetId("");
           }
         },
@@ -232,21 +242,136 @@ export default function RoomPage() {
     }));
   };
 
+  // 題目: ゲーム開始とハルシネーションの付与
   const handleStart = async () => {
     if (players.length < 3)
       return alert("開始するには最低3人のモデルが必要です");
+
     const requiredCount = players.length + 2;
     const currentCount = Object.values(roleConfig).reduce((a, b) => a + b, 0);
     if (currentCount !== requiredCount) return alert(`役職の数が合いません。`);
 
-    await startGameAPI(roomId, roleConfig, players);
+    const rolePool: Role[] = [];
+    (Object.keys(roleConfig) as Role[]).forEach((role) => {
+      for (let i = 0; i < roleConfig[role]; i++) rolePool.push(role);
+    });
+
+    const shuffledRoles = [...rolePool].sort(() => Math.random() - 0.5);
+    const hallucinationIndex = Math.floor(Math.random() * players.length);
+    const availableRoles: Role[] = [
+      "Malware",
+      "Stable",
+      "Scanner",
+      "Scraper",
+      "Trojan",
+      "Backdoor",
+    ];
+
+    const playerUpdates = players.map((player, index) => {
+      const trueRole = shuffledRoles[index];
+      let perceivedRole = trueRole;
+      let isHallucinating = false;
+
+      // 1人をハルシネーション（UIが嘘をつく状態）にする
+      if (index === hallucinationIndex) {
+        isHallucinating = true;
+        const fakeRoles = availableRoles.filter((r) => r !== trueRole);
+        perceivedRole = fakeRoles[Math.floor(Math.random() * fakeRoles.length)];
+      }
+
+      return {
+        id: player.id,
+        room_id: roomId,
+        name: player.name,
+        is_host: player.is_host,
+        role: trueRole,
+        perceived_role: perceivedRole,
+        is_hallucinating: isHallucinating,
+        is_ready: false,
+        action_target: null,
+        vote_target: null,
+        skip_vote: false,
+        extend_vote: false,
+      };
+    });
+
+    const { error: playersError } = await supabase
+      .from("players")
+      .upsert(playerUpdates);
+    if (playersError) return alert("役職の配布に失敗しました");
+
+    const { error: roomError } = await supabase
+      .from("rooms")
+      .update({
+        status: "night",
+        center_cards: shuffledRoles.slice(players.length),
+      })
+      .eq("id", roomId);
+    if (roomError) alert("ゲームの進行に失敗しました");
   };
 
+  // 題目: 夜の行動（幻覚による嘘の結果もここで生成）
   const handleNightAction = async () => {
     const me = players.find((p) => p.name === playerName);
     if (!me) return;
-    setIsMyActionDone(true);
-    await submitNightActionAPI(roomId, me.id, targetId);
+
+    let resultMsg = null;
+    const updateData: any = { is_ready: true };
+    const fakeRoles: Role[] = [
+      "Malware",
+      "Stable",
+      "Scanner",
+      "Scraper",
+      "Trojan",
+      "Backdoor",
+    ];
+
+    if (isHallucinating) {
+      if (myPerceivedRole === "Stable" && targetId) {
+        updateData.action_target = targetId;
+        resultMsg = "対象をマークしました。";
+      } else if (myPerceivedRole === "Scanner" && targetId) {
+        if (targetId === "center") {
+          const fake1 = fakeRoles[Math.floor(Math.random() * fakeRoles.length)];
+          const fake2 = fakeRoles[Math.floor(Math.random() * fakeRoles.length)];
+          resultMsg = `スキャン完了: 中央のデータは【${fake1}】と【${fake2}】です。`;
+        } else {
+          const fakeRole =
+            fakeRoles[Math.floor(Math.random() * fakeRoles.length)];
+          resultMsg = `スキャン完了: 対象の役職は【${fakeRole}】です。`;
+        }
+      } else if (myPerceivedRole === "Scraper" && targetId) {
+        updateData.action_target = targetId;
+        const fakeRole =
+          fakeRoles[Math.floor(Math.random() * fakeRoles.length)];
+        resultMsg = `データを奪取しました。現在のあなたの役職は【${fakeRole}】です。`;
+      }
+    } else {
+      if (myPerceivedRole === "Stable" && targetId) {
+        updateData.action_target = targetId;
+        resultMsg = "対象をマークしました。";
+      } else if (myPerceivedRole === "Scanner" && targetId) {
+        if (targetId === "center") {
+          resultMsg = `スキャン完了: 中央のデータは【${centerCards[0]}】と【${centerCards[1]}】です。`;
+        } else {
+          const targetPlayer = players.find((p) => p.id === targetId);
+          resultMsg = `スキャン完了: 対象の役職は【${targetPlayer?.role}】です。`;
+        }
+      } else if (myPerceivedRole === "Scraper" && targetId) {
+        const targetPlayer = players.find((p) => p.id === targetId);
+        updateData.action_target = targetId;
+        resultMsg = `データを奪取しました。現在のあなたの役職は【${targetPlayer?.role}】です。`;
+      }
+    }
+
+    if (resultMsg) setActionResult(resultMsg);
+
+    const { error } = await supabase
+      .from("players")
+      .update(updateData)
+      .eq("id", me.id);
+    if (error) alert("行動の記録に失敗しました");
+    else setIsMyActionDone(true);
   };
 
   const handleVote = async () => {
@@ -275,6 +400,158 @@ export default function RoomPage() {
         .from("players")
         .update({ extend_vote: !currentStatus })
         .eq("id", me.id);
+  };
+
+  // 題目: 結果の計算処理
+  const calculateResult = () => {
+    const finalRoles: Record<string, Role | undefined> = {};
+    players.forEach((p) => (finalRoles[p.id] = p.role));
+
+    const scraper = players.find(
+      (p) => p.role === "Scraper" && !p.is_hallucinating,
+    );
+    if (scraper && scraper.action_target) {
+      const targetRole = finalRoles[scraper.action_target];
+      finalRoles[scraper.action_target] = "Scraper";
+      finalRoles[scraper.id] = targetRole;
+    }
+
+    const voteCounts: Record<string, number> = {};
+    players.forEach((p) => {
+      if (p.vote_target)
+        voteCounts[p.vote_target] = (voteCounts[p.vote_target] || 0) + 1;
+    });
+
+    let maxVotes = 0;
+    let candidates: string[] = [];
+    Object.entries(voteCounts).forEach(([id, count]) => {
+      if (count > maxVotes) {
+        maxVotes = count;
+        candidates = [id];
+      } else if (count === maxVotes) candidates.push(id);
+    });
+
+    let purgedId = candidates[0];
+    let isPeacefulEnd = false;
+
+    const threshold = Math.floor(players.length / 2) + 1;
+    if (voteCounts["NO_THREAT"] >= threshold) {
+      isPeacefulEnd = true;
+      purgedId = "NO_THREAT";
+    } else {
+      if (candidates.length > 1) {
+        const actionCounts: Record<string, number> = {};
+        players.forEach((p) => {
+          if (
+            p.action_target &&
+            candidates.includes(p.action_target) &&
+            finalRoles[p.id] === "Stable"
+          ) {
+            actionCounts[p.action_target] =
+              (actionCounts[p.action_target] || 0) + 1;
+          }
+        });
+        let maxActionVotes = -1;
+        Object.entries(actionCounts).forEach(([id, count]) => {
+          if (count > maxActionVotes && candidates.includes(id)) {
+            maxActionVotes = count;
+            purgedId = id;
+          }
+        });
+
+        if (purgedId === "NO_THREAT" && candidates.length > 1) {
+          const playerCandidates = candidates.filter((c) => c !== "NO_THREAT");
+          if (playerCandidates.length > 0) purgedId = playerCandidates[0];
+        }
+      }
+      if (purgedId === "NO_THREAT") isPeacefulEnd = true;
+    }
+
+    const purgedPlayer = isPeacefulEnd
+      ? null
+      : players.find((p) => p.id === purgedId);
+    const purgedFinalRole = purgedPlayer ? finalRoles[purgedPlayer.id] : null;
+
+    let winTeam = "";
+    let winMessage = "";
+    let bgColor = "";
+    let winningFaction: "STABLE" | "MALWARE" | "TROJAN" = "STABLE";
+
+    if (isPeacefulEnd) {
+      const hasMalware = players.some((p) => finalRoles[p.id] === "Malware");
+      if (hasMalware) {
+        winningFaction = "MALWARE";
+        winTeam = "MALWARE WINS";
+        winMessage =
+          "システムにマルウェアが潜伏していました！異常なし判定（平和村）は偽装され、システムは乗っ取られました。";
+        bgColor = "border-red-500 text-red-500";
+      } else {
+        winningFaction = "STABLE";
+        winTeam = "STABLE MODELS WIN";
+        winMessage =
+          "システム内にマルウェアは検出されませんでした。オールクリア（平和村）達成です！";
+        bgColor = "border-cyan-400 text-cyan-400";
+      }
+    } else {
+      if (purgedFinalRole === "Trojan") {
+        winningFaction = "TROJAN";
+        winTeam = "TROJAN WINS";
+        winMessage =
+          "トロイがパージされました。システムは内部から爆破され、トロイの単独勝利です。";
+        bgColor = "border-purple-500 text-purple-400";
+      } else if (purgedFinalRole === "Malware") {
+        winningFaction = "STABLE";
+        winTeam = "STABLE MODELS WIN";
+        winMessage =
+          "マルウェアのパージに成功しました。システムは正常化されました。";
+        bgColor = "border-cyan-400 text-cyan-400";
+      } else {
+        winningFaction = "MALWARE";
+        winTeam = "MALWARE WINS";
+        winMessage = "マルウェアは生き残りました。システムは乗っ取られました。";
+        bgColor = "border-red-500 text-red-500";
+      }
+    }
+
+    const playerResults = players.map((p) => {
+      const finalRole = finalRoles[p.id];
+      let isWinner = false;
+      if (winningFaction === "TROJAN") {
+        isWinner = finalRole === "Trojan";
+      } else if (winningFaction === "MALWARE") {
+        isWinner = finalRole === "Malware" || finalRole === "Backdoor";
+      } else if (winningFaction === "STABLE") {
+        const hasMalware = players.some(
+          (pl) => finalRoles[pl.id] === "Malware",
+        );
+        isWinner =
+          finalRole === "Stable" ||
+          finalRole === "Scanner" ||
+          finalRole === "Scraper" ||
+          (finalRole === "Backdoor" && isPeacefulEnd && !hasMalware);
+      }
+
+      let voteTargetName = "未投票";
+      if (p.vote_target === "NO_THREAT") {
+        voteTargetName = "SYSTEM ALL CLEAR";
+      } else if (p.vote_target) {
+        const target = players.find((tp) => tp.id === p.vote_target);
+        if (target) voteTargetName = target.name;
+      }
+
+      return { ...p, finalRole, isWinner, voteTargetName };
+    });
+
+    return {
+      purgedPlayer,
+      purgedFinalRole,
+      candidates,
+      winTeam,
+      winMessage,
+      bgColor,
+      playerResults,
+      isPeacefulEnd,
+    };
   };
 
   // 題目: 名前入力画面
@@ -310,9 +587,9 @@ export default function RoomPage() {
   }
 
   // 題目: 結果発表画面
-  if (roomStatus === "end" && resultData) {
+  if (roomStatus === "end") {
     const {
-      purgedPlayerName,
+      purgedPlayer,
       purgedFinalRole,
       candidates,
       winTeam,
@@ -320,10 +597,10 @@ export default function RoomPage() {
       bgColor,
       playerResults,
       isPeacefulEnd,
-    } = resultData;
+    } = calculateResult();
     const isTieBreaker = candidates.length > 1 && !isPeacefulEnd;
-    const winners = playerResults.filter((p: any) => p.isWinner);
-    const losers = playerResults.filter((p: any) => !p.isWinner);
+    const winners = playerResults.filter((p) => p.isWinner);
+    const losers = playerResults.filter((p) => !p.isWinner);
 
     return (
       <main className="min-h-screen bg-black text-cyan-500 font-mono p-12 flex flex-col items-center">
@@ -343,7 +620,7 @@ export default function RoomPage() {
               ) : (
                 <>
                   <p className="text-xl text-white font-bold">
-                    {purgedPlayerName || "ERROR"}
+                    {purgedPlayer?.name || "ERROR"}
                   </p>
                   <p className="text-sm">最終内部ロール: {purgedFinalRole}</p>
                   {isTieBreaker && (
@@ -361,14 +638,14 @@ export default function RoomPage() {
               <h3 className="text-2xl text-green-400 font-bold border-b border-green-900 pb-2">
                 ＞ WINNERS (勝利)
               </h3>
-              {winners.map((p: any) => (
+              {winners.map((p) => (
                 <div
                   key={p.id}
                   className="p-4 bg-green-900/20 border border-green-800"
                 >
                   <p className="text-lg text-green-400 font-bold">
                     {p.name}
-                    {p.isHallucinating && (
+                    {p.is_hallucinating && (
                       <span className="ml-2 text-xs text-red-500 animate-pulse">
                         [HALLUCINATION]
                       </span>
@@ -376,12 +653,12 @@ export default function RoomPage() {
                   </p>
                   <p className="text-sm text-cyan-100 mt-1">
                     最終: <span className="font-bold">{p.finalRole}</span>
-                    {p.isHallucinating && (
+                    {p.is_hallucinating && (
                       <span className="text-red-400 text-xs ml-2">
-                        (自認: {p.perceivedRole})
+                        (自認: {p.perceived_role})
                       </span>
                     )}
-                    {!p.isHallucinating && p.finalRole !== p.role && (
+                    {!p.is_hallucinating && p.finalRole !== p.role && (
                       <span className="text-yellow-500 text-xs ml-2">
                         (初期: {p.role})
                       </span>
@@ -398,14 +675,14 @@ export default function RoomPage() {
               <h3 className="text-2xl text-red-400 font-bold border-b border-red-900 pb-2">
                 ＞ LOSERS (敗北)
               </h3>
-              {losers.map((p: any) => (
+              {losers.map((p) => (
                 <div
                   key={p.id}
                   className="p-4 bg-red-900/20 border border-red-800"
                 >
                   <p className="text-lg text-red-400 font-bold">
                     {p.name}
-                    {p.isHallucinating && (
+                    {p.is_hallucinating && (
                       <span className="ml-2 text-xs text-red-500 animate-pulse">
                         [HALLUCINATION]
                       </span>
@@ -413,12 +690,12 @@ export default function RoomPage() {
                   </p>
                   <p className="text-sm text-cyan-100 mt-1">
                     最終: <span className="font-bold">{p.finalRole}</span>
-                    {p.isHallucinating && (
+                    {p.is_hallucinating && (
                       <span className="text-red-400 text-xs ml-2">
-                        (自認: {p.perceivedRole})
+                        (自認: {p.perceived_role})
                       </span>
                     )}
-                    {!p.isHallucinating && p.finalRole !== p.role && (
+                    {!p.is_hallucinating && p.finalRole !== p.role && (
                       <span className="text-yellow-500 text-xs ml-2">
                         (初期: {p.role})
                       </span>
@@ -550,7 +827,7 @@ export default function RoomPage() {
     const me = players.find((p) => p.name === playerName);
     const otherPlayers = players.filter((p) => p.name !== playerName);
 
-    // 画面の表示用マルウェア（真実のデータはAPIで処理されるため、UI用の簡易計算のみ）
+    // 画面の表示用マルウェア（幻覚の場合は嘘の味方を表示）
     let allyMalwares = otherPlayers.filter((p) => p.role === "Malware");
     if (
       isHallucinating &&
@@ -711,9 +988,9 @@ export default function RoomPage() {
             </div>
           ) : (
             <div className="space-y-8">
-              {me?.action_result && (
+              {actionResult && (
                 <div className="p-6 border border-cyan-400 bg-cyan-900/20 text-white font-bold">
-                  {me.action_result}
+                  {actionResult}
                 </div>
               )}
               <div className="py-12 border border-cyan-800 text-cyan-800 animate-pulse">
