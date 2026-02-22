@@ -1,0 +1,22 @@
+name: Prevent Supabase Sleep (Daily Ping)
+
+on:
+  schedule:
+    # UTC 01:15 AM に実行 (JST 10:15 AM)
+    - cron: "15 1 * * *"
+  workflow_dispatch:
+
+jobs:
+  make_request:
+    runs-on: ubuntu-latest
+    env:
+      TZ: "Asia/Tokyo"
+
+    steps:
+      - name: Send HTTP GET request
+        run: |
+          curl -X GET "https://hallucination-nine.vercel.app/" -v --fail || exit 1
+
+      - name: Log request time
+        run: |
+          echo "Keep-alive ping completed at $(date)"
