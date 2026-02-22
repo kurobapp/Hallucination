@@ -21,6 +21,7 @@ type Role =
 
 type Player = {
   id: string;
+  room_id: string;
   name: string;
   is_host: boolean;
   role?: Role;
@@ -98,14 +99,13 @@ export default function RoomPage() {
           if (roomData?.status === "vote") setIsMyActionDone(!!me.vote_target);
         }
 
-        // サーバーロジック呼び出しのトリガー（ホストのみ実行）
         if (
           roomData?.status === "vote" &&
           playersData.length > 0 &&
           me?.is_host
         ) {
           const allVoted = playersData.every((p: Player) => p.vote_target);
-          if (allVoted) await calculateResultAPI(roomId); // API呼び出し
+          if (allVoted) await calculateResultAPI(roomId);
         }
 
         if (
@@ -239,14 +239,14 @@ export default function RoomPage() {
     const currentCount = Object.values(roleConfig).reduce((a, b) => a + b, 0);
     if (currentCount !== requiredCount) return alert(`役職の数が合いません。`);
 
-    await startGameAPI(roomId, roleConfig, players); // サーバーで処理
+    await startGameAPI(roomId, roleConfig, players);
   };
 
   const handleNightAction = async () => {
     const me = players.find((p) => p.name === playerName);
     if (!me) return;
-    setIsMyActionDone(true); // UIを先に更新
-    await submitNightActionAPI(roomId, me.id, targetId); // サーバーで計算・保存
+    setIsMyActionDone(true);
+    await submitNightActionAPI(roomId, me.id, targetId);
   };
 
   const handleVote = async () => {
@@ -309,7 +309,7 @@ export default function RoomPage() {
     );
   }
 
-  // 題目: 結果発表画面（サーバー計算結果の表示のみ）
+  // 題目: 結果発表画面
   if (roomStatus === "end" && resultData) {
     const {
       purgedPlayerName,
