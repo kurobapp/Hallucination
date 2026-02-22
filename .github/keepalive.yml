@@ -1,0 +1,19 @@
+name: Supabase Keep Alive
+
+on:
+  schedule:
+    # 日本時間の午前9時（UTCの深夜0時）に、3日に1回の頻度で実行します
+    - cron: "0 0 */3 * *"
+  workflow_dispatch: # GitHubの画面から手動で実行してテストするための設定です
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Supabase Database
+        # SupabaseのREST APIを使って、roomsテーブルに軽くアクセスします
+        run: |
+          curl -s -X GET "${{ secrets.SUPABASE_URL }}/rest/v1/rooms?select=id&limit=1" \
+          -H "apikey: ${{ secrets.SUPABASE_ANON_KEY }}" \
+          -H "Authorization: Bearer ${{ secrets.SUPABASE_ANON_KEY }}" \
+          -w "\nHTTP Status: %{http_code}\n"
